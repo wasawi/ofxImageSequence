@@ -129,10 +129,10 @@ class ofxImageSequence : public ofBaseHasTexture {
 	int getTotalFrames();					//returns how many frames are in the sequence
 	float getLengthInSeconds();				//returns the sequence duration based on frame rate
 	
-	float getWidth();						//returns the width/height of the sequence
-	float getHeight();
-	bool isLoaded();						//returns true if the sequence has been loaded
-	bool isLoading();						//returns true if loading during thread
+	float getWidth() const;						//returns the width/height of the sequence
+	float getHeight() const;
+	bool isLoaded() const;						//returns true if the sequence has been loaded
+	bool isLoading() const;						//returns true if loading during thread
 	void loadFrame(int imageIndex);			//allows you to load (cache) a frame to avoid a stutter when loading. use this to "read ahead" if you want
 	
 	void setMinMagFilter(int minFilter, int magFilter);

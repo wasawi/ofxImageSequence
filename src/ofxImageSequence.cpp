@@ -353,12 +353,12 @@ float ofxImageSequence::getPercentAtFrameIndex(int index)
 	return ofMap(index, 0, sequence.size()-1, 0, 1.0, true);
 }
 
-float ofxImageSequence::getWidth()
+float ofxImageSequence::getWidth() const
 {
 	return width;
 }
 
-float ofxImageSequence::getHeight()
+float ofxImageSequence::getHeight() const
 {
 	return height;
 }
@@ -497,10 +497,10 @@ int ofxImageSequence::getTotalFrames()
 	return sequence.size();
 }
 
-bool ofxImageSequence::isLoaded(){						//returns true if the sequence has been loaded
+bool ofxImageSequence::isLoaded() const{						//returns true if the sequence has been loaded
     return loaded;
 }
 
-bool ofxImageSequence::isLoading(){
+bool ofxImageSequence::isLoading() const{
 	return threadLoader != NULL && threadLoader->loading;
 }
