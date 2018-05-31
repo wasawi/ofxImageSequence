@@ -28,7 +28,7 @@
  *
  * ----------------------
  *
- *  ofxImageSequence is a class for easily loading a series of image files
+ *  ofxImageSequence is a class for easily importing a series of image files
  *  and accessing them like you would frames of a movie.
  *  
  *  This class loads only textures to the graphics card and does not store pixel data in memory. This helps with
@@ -43,186 +43,443 @@
 
 #include "ofxImageSequence.h"
 
-class ofxImageSequenceLoader : public ofThread
-{
-  public:
-
-	bool loading;
-	bool cancelLoading;
+class ofxImageSequenceExporter : public ofThread {
+private:
+	bool paused;
+	bool exporting;
 	ofxImageSequence& sequenceRef;
-	
-	ofxImageSequenceLoader(ofxImageSequence* seq)
-	: sequenceRef(*seq)
-	, loading(true)
-	, cancelLoading(false)
+public:
+	bool cancelExport;
+	explicit ofxImageSequenceExporter(ofxImageSequence* seq)
+		: sequenceRef(*seq)
+		, exporting(true)
+		, cancelExport(false)
+		, paused(false)
 	{
+		ofLogVerbose("ofxImageSequenceExporter") << "Ctor";
+	}
+
+	~ofxImageSequenceExporter() {
+		ofLogVerbose("ofxImageSequenceExporter") << "Dtor";
+	}
+
+	void pause() {
+		stopThread();
+		lock();
+			cancelExport = true;
+		unlock();
+		paused = true;
+	}
+	void resume() {
+		lock();
+			cancelExport = false;
+		unlock();
+		paused = false;
+		exporting = true;
 		startThread(true);
 	}
-	
-	~ofxImageSequenceLoader(){
-        cancel();
-    }
-	
-    void cancel(){
-		if(loading){
-			ofRemoveListener(ofEvents().update, this, &ofxImageSequenceLoader::updateThreadedLoad);
-            lock();
-			cancelLoading = true;
-            unlock();
-            loading = false;
-			waitForThread(true);
+
+	void cancel() {
+		lock();
+			cancelExport = true;
+		unlock();
+		paused = false;
+		exporting = false;
+		waitForThread(true);
+	}
+
+	void threadedFunction() {
+		ofAddListener(ofEvents().update, this, &ofxImageSequenceExporter::updateThreadedExport);
+		sequenceRef.exportAllFrames();
+		// task is finished. Let it close.
+		exporting = false;
+	}
+
+	void updateThreadedExport(ofEventArgs& args) {
+		if (exporting || paused) {
+			return;
 		}
+		// task is finished. Let it close.
+		ofRemoveListener(ofEvents().update, this, &ofxImageSequenceExporter::updateThreadedExport);
+		ofLogVerbose("ofxImageSequenceExporter::updateThreadedExport") << "stop export thread.";
+		stopThread();
+		sequenceRef.completeExporting();
+		sequenceRef.deleteExportThread();
+	}
+};
+
+
+class ofxImageSequenceImporter : public ofThread
+{
+private:
+	bool paused;
+	bool importing;
+	ofxImageSequence& sequenceRef;
+public:
+	bool cancelImport;
+	explicit ofxImageSequenceImporter(ofxImageSequence* seq)
+	: sequenceRef(*seq)
+	, importing(true)
+	, cancelImport(false)
+	, paused(false)
+	{
+		ofLogVerbose("ofxImageSequenceImporter") << "Ctor";
+//		startThread(true);	// this is a bad practice. 
+							// imageSequence might want to call the ofxImageSequenceImporter instance 
+							// and the instance returns NULL because the construction has not finished yet.
+							// so its better to construct ofxImageSequenceImporter instance without any action
+							// and call the tread to start when the instance is fully constructed.
+	}
+	
+	~ofxImageSequenceImporter(){
+		ofLogVerbose("ofxImageSequenceImporter") << "Dtor";
+    }
+
+	void pause() {
+		ofLogVerbose("ofxImageSequenceImporter") << "pause";
+		stopThread();
+		lock();
+			cancelImport = true;
+		unlock();
+		paused = true;
+	}
+	void resume() {
+		ofLogVerbose("ofxImageSequenceImporter") << "resume";
+		lock();
+			cancelImport = false;
+		unlock();
+		paused = false;
+		importing = true;
+		startThread(true);
+	}
+
+    void cancel(){
+		ofLogVerbose("ofxImageSequenceImporter") << "cancel";
+		lock();
+			cancelImport = true;
+		unlock();
+		paused = false;
+		importing = false;
+		waitForThread(true);
     }
     
 	void threadedFunction(){
 	
-		ofAddListener(ofEvents().update, this, &ofxImageSequenceLoader::updateThreadedLoad);
+		ofAddListener(ofEvents().update, this, &ofxImageSequenceImporter::updateThreadedLoad);
 
-		if(!sequenceRef.preloadAllFilenames()){
-			loading = false;
-			return;
-		}
-
-		if(cancelLoading){
-			loading = false;
-			cancelLoading = false;
+		// load paths and check names
+		if(!sequenceRef.readFileNames()){
+			importing = false;
 			return;
 		}
 	
+		// load the images to memory
 		sequenceRef.preloadAllFrames();
-	
-		loading = false;
+		// task is finished. Let it close.
+		importing = false;
 	}
 
-	void updateThreadedLoad(ofEventArgs& args){
-		if(loading){
+	void updateThreadedLoad(ofEventArgs& args) {
+		if (importing || paused) {
 			return;
 		}
-		ofRemoveListener(ofEvents().update, this, &ofxImageSequenceLoader::updateThreadedLoad);
-
-		if(sequenceRef.getTotalFrames() > 0){
-			sequenceRef.completeLoading();
-		}
+		// task is finished. Let it close.
+		ofRemoveListener(ofEvents().update, this, &ofxImageSequenceImporter::updateThreadedLoad);
+		ofLogVerbose("ofxImageSequenceImporter::updateThreadedLoad") << "stop load thread.";
+		stopThread();
+		sequenceRef.completeImporting();
+		sequenceRef.deleteImportThread();
 	}
-
 };
 
 ofxImageSequence::ofxImageSequence()
 {
+	ofLogVerbose("ofxImageSequence") << "Ctor";
+	status = Status_Undefined;
+
+	importThread = NULL;
+	exportThread = NULL;
+
+	imported = false;
+	exported = false;
 	loaded = false;
-	useThread = false;
+
+	useThreadToImport = false;
+	useThreadToExport = false;
+
+	lastImportedFrame = -1;
+	lastExportedFrame = -1;
+	lastLoadedFrame = -1;
+	lastDisplayedFrame = -1;
+
+	expectedLength = 0;
+
 	frameRate = 30.0f;
-	lastFrameLoaded = -1;
 	currentFrame = 0;
 	maxFrames = 0;
-	curLoadFrame = 0;
-	threadLoader = NULL;
+	nameCounter = 0;
+	numberWidth = 3;
+	overwrite = false;
+	exportQuality = OF_IMAGE_QUALITY_BEST;
+	creationTimeStamp = ofGetTimestampString();
+
+	width = -1;
+	height = -1;
+	minFilter = -1;
+	magFilter = -1;
 }
 
 ofxImageSequence::~ofxImageSequence()
 {
-	unloadSequence();
+	ofLogVerbose("ofxImageSequence") << "Dtor";
+	// we must unload sequences, but, most important,
+	// stop and close threads!
+	deleteSequence();
 }
 
-bool ofxImageSequence::loadSequence(string prefix, string filetype,  int startDigit, int endDigit)
-{
-	return loadSequence(prefix, filetype, startDigit, endDigit, 0);
+
+/*
+void addFrame(ofImage &img) {
+addFrame(img.getPixelsRef());
 }
 
-bool ofxImageSequence::loadSequence(string prefix, string filetype,  int startDigit, int endDigit, int numDigits)
+void addFrame(ofVideoGrabber &cam) {
+addFrame(cam.getPixelsRef());
+}
+
+void addFrame(ofVideoPlayer &player) {
+addFrame(player.getPixelsRef());
+}
+*/
+
+void ofxImageSequence::startLoading(unsigned long length)
 {
-	unloadSequence();
+	status = Status_Loading;
+	loaded = false;
+	expectedLength = length;
+}
 
-	char imagename[1024];
-	stringstream format;
-	int numFiles = endDigit - startDigit+1;
-	if(numFiles <= 0 ){
-		ofLogError("ofxImageSequence::loadSequence") << "No image files found.";
-		return false;
+void ofxImageSequence::addFrame(ofPixels& imageToSave, string name) {
+
+	if (extensionExport != "") {
+		ofLogVerbose("ofxImageSequence::addFrame") << "no extension given. setting default (png).";
+		extensionExport = "png";
 	}
 
-	if(numDigits != 0){
-		format <<prefix<<"%0"<<numDigits<<"d."<<filetype;
-	} else{
-		format <<prefix<<"%d."<<filetype; 
+	string fileName;
+	if (name == "") {
+		fileName = ofToString(nameCounter, numberWidth, '0') + "." + extensionExport;
+		nameCounter++;
 	}
-	
-	for(int i = startDigit; i <= endDigit; i++){
-		sprintf(imagename, format.str().c_str(), i);
-		filenames.push_back(imagename);
-		sequence.push_back(ofPixels());
-		loadFailed.push_back(false);
+	else {
+		fileName = name;
 	}
-	
-	loaded = true;
-	
-	lastFrameLoaded = -1;
-	loadFrame(0);
-	
-	width  = sequence[0].getWidth();
-	height = sequence[0].getHeight();
+
+	filenames.push_back(fileName);
+	sequence.push_back(imageToSave);
+	loadFailed.push_back(false);
+	lastLoadedFrame = sequence.size();
+}
+
+
+bool ofxImageSequence::importSequence(string prefix, string filetype,  int startDigit, int endDigit)
+{
+	return importSequence(prefix, filetype, startDigit, endDigit, 0);
+}
+
+bool ofxImageSequence::importSequence(string prefix, string filetype,  int startDigit, int endDigit, int numDigits)
+{
+//	status = Status_Importing;
+//
+//	deleteSequence();
+//
+//	char imagename[1024];
+//	stringstream format;
+//	int numFiles = endDigit - startDigit + 1;
+//	if(numFiles <= 0 ){
+//		ofLogError("ofxImageSequence::importSequence") << "No image files found.";
+//		return false;
+//	}
+//
+//	if(numDigits != 0){
+//		format <<prefix<<"%0"<<numDigits<<"d."<<filetype;
+//	} else{
+//		format <<prefix<<"%d."<<filetype; 
+//	}
+//	
+//	for(int i = startDigit; i <= endDigit; i++){
+//		sprintf_s(imagename, format.str().c_str(), i);
+//		filenames.push_back(imagename);
+//		sequence.push_back(ofPixels());
+//		loadFailed.push_back(false);
+//	}
+//	
+//	if (useThreadToImport) {
+//		importThread = new ofxImageSequenceImporter(this);
+////		importThread->startThread(true);
+//	}
+//	else {
+//		preloadAllFrames();
+//		completeImporting();
+//	}
 	return true;
 }
 
-bool ofxImageSequence::loadSequence(string _folder)
+bool ofxImageSequence::exportSequence(string _folder, string _extension)
 {
-	unloadSequence();
+	status = Status_Exporting;
 
-	folderToLoad = _folder;
+	extensionExport = _extension;
+	folderToExport =  "data/" +_folder;
+	lastExportedFrame = 0;
+	expectedLength = sequence.size();
 
-	if(useThread){
-		threadLoader = new ofxImageSequenceLoader(this);
-		return true;
+	// before exporting we clear the previous export
+//	ofDirectory exportFolder;
+//	exportFolder.removeDirectory(folderToExport, true, true);
+//	exportFolder.createDirectory(folderToExport, true);
+
+	if (useThreadToExport) {
+//		ofPtr<ofxImageSequenceExporter> exportThread(new ofxImageSequenceExporter(this));
+		exportThread = new ofxImageSequenceExporter(this);
+		exportThread->startThread(true);
 	}
-
-	if(preloadAllFilenames()){
-		completeLoading();
-		return true;
+	else {
+		exportAllFrames();
+		completeExporting();
 	}
-	
-	return false;
-
+	return true;
 }
 
-void ofxImageSequence::completeLoading()
-{
 
+bool ofxImageSequence::importSequence(string _folder)
+{
+	status = Status_Importing;
+
+	if (imported) {
+		deleteSequence();
+	}
+
+	folderToImport = _folder;
+	lastImportedFrame = 0;
+
+	if(useThreadToImport){
+//		ofPtr<ofxImageSequenceImporter> importThread(new ofxImageSequenceImporter(this));
+		importThread = new ofxImageSequenceImporter(this);
+		importThread->startThread(true);
+	}
+	else {
+		if (readFileNames()) {
+			completeImporting();
+		}
+	}
+	return true;
+}
+
+void ofxImageSequence::completeImporting()
+{
 	if(sequence.size() == 0){
-		ofLogError("ofxImageSequence::completeLoading") << "load failed with empty image sequence";
+		ofLogError("ofxImageSequence::completeImporting") << "load failed with empty image sequence";
+		// notify sequence container that sequence has finished importing.
+		ofNotifyEvent(importComplete_event, *this);
+		status = Status_Ready;	// Hack, this has to be after ofNotifyEvent. needs better solution.
 		return;
 	}
 
-	loaded = true;	
-	lastFrameLoaded = -1;
-	loadFrame(0);
-	
-	width  = sequence[0].getWidth();
+	width = sequence[0].getWidth();
 	height = sequence[0].getHeight();
 
+
+	// notify sequence container that sequence has finished importing.
+	ofNotifyEvent(importComplete_event, *this);
+
+	imported = true;
+	lastImportedFrame = -1;
+	status = Status_Ready;	// Hack, this has to be after ofNotifyEvent. needs better solution.
+
+	ofLogVerbose("ofxImageSequence::completeImporting") << "import complete.";
+	ofLogNotice() << "stored  " << sequence.size() << " frames";
 }
 
-bool ofxImageSequence::preloadAllFilenames()
+void ofxImageSequence::completeExporting()
 {
-    ofDirectory dir;
-	if(extension != ""){
-		dir.allowExt(extension);
+	if (sequence.size() == 0) {
+		ofLogError("ofxImageSequence::completeExporting") << "export failed with empty image sequence";
+		// notify sequence container that sequence has finished exporting.
+		ofNotifyEvent(exportComplete_event, *this);
+		status = Status_Ready;	// Hack, this has to be after ofNotifyEvent. needs better solution.
+		return;
 	}
-	
-	if(!ofFile(folderToLoad).exists()){
-		ofLogError("ofxImageSequence::loadSequence") << "Could not find folder " << folderToLoad;
+
+	// notify sequence container that sequence has finished exporting.
+	ofNotifyEvent(exportComplete_event, *this);
+
+	exported = true;
+	lastExportedFrame = -1;
+	status = Status_Ready;
+
+	ofLogVerbose("ofxImageSequence::completeExporting") << "export complete.";
+}
+
+bool ofxImageSequence::completeLoading()
+{
+	if (sequence.size() == 0) {
+		ofLogError("ofxImageSequence::completeLoading") << "load failed with empty image sequence";
+		// probably we would need to destroy 0 frame sequences.
+
+		// notify sequence container that sequence has finished loading.
+		ofNotifyEvent(loadComplete_event, *this);
+		loaded = true;
 		return false;
 	}
 
-	int numFiles;
+	width = sequence[0].getWidth();
+	height = sequence[0].getHeight();
+
+	// notify sequence container that sequence has finished loading.
+	ofNotifyEvent(loadComplete_event, *this);
+
+	loaded = true;
+	lastLoadedFrame = -1;
+
+	// not sure why this was here.. probably not needed.
+	//texture.clear();
+	//loadFrameToTexture(0);
+
+	status = Status_Ready;
+	ofLogVerbose("ofxImageSequence::completeLoading") << "load complete.";
+	ofLogNotice() << "stored  " << sequence.size() << " frames";
+	return true;
+}
+
+bool ofxImageSequence::readFileNames()
+{
+    ofDirectory dir;
+	dir.allowExt("png");
+	dir.allowExt("jpg");
+	dir.allowExt("jpeg");
+	dir.allowExt("tiff");
+	dir.allowExt("bmp");
+
+	if(extensionImport != ""){
+		dir.allowExt(extensionImport);
+	}
+	
+	if(!ofFile(folderToImport).exists()){
+		ofLogError("ofxImageSequence::readFileNames") << "Could not find folder " << folderToImport;
+		return false;
+	}
+
+	int numFiles = 0;
 	if(maxFrames > 0){
-		numFiles = MIN(dir.listDir(folderToLoad), maxFrames);
+		numFiles = MIN(dir.listDir(folderToImport), maxFrames);
 	}
 	else{	
-		numFiles = dir.listDir(folderToLoad);
+		numFiles = dir.listDir(folderToImport);
 	}
 
     if(numFiles == 0) {
-		ofLogError("ofxImageSequence::loadSequence") << "No image files found in " << folderToLoad;
+		ofLogError("ofxImageSequence::readFileNames") << "No image files found in " << folderToImport;
 		return false;
 	}
 
@@ -230,14 +487,23 @@ bool ofxImageSequence::preloadAllFilenames()
 	#ifdef TARGET_LINUX
 	dir.sort();
 	#endif
-
+	
+	// we can't clear because if we pause and resume we will brake storage.
+	filenames.clear();
+//	sequence.clear();
+//	loadFailed.clear();
 
 	for(int i = 0; i < numFiles; i++) {
+		string filename = ofFilePath::getFileName(dir.getPath(i));
+		extensionImport = ofFilePath::getFileExt(dir.getPath(i));
+		ofStringReplace(filename, "." + extensionImport, "");
 
-        filenames.push_back(dir.getPath(i));
-		sequence.push_back(ofPixels());
-		loadFailed.push_back(false);
+        filenames.push_back(filename);
+		//sequence.push_back(ofPixels());
+		//loadFailed.push_back(false);
     }
+
+	expectedLength = numFiles;
 	return true;
 }
 
@@ -245,32 +511,105 @@ bool ofxImageSequence::preloadAllFilenames()
 void ofxImageSequence::setMaxFrames(int newMaxFrames)
 {
 	maxFrames = MAX(newMaxFrames, 0);
-	if(loaded){
+	if(imported){
 		ofLogError("ofxImageSequence::setMaxFrames") << "Max frames must be called before load";
 	}
 }
 
-void ofxImageSequence::setExtension(string ext)
+void ofxImageSequence::setExtensionToImport(string ext)
 {
-	extension = ext;
+	extensionImport = ext;
 }
 
-void ofxImageSequence::enableThreadedLoad(bool enable){
-
-	if(loaded){
-		ofLogError("ofxImageSequence::enableThreadedLoad") << "Need to enable threaded loading before calling load";
-	}
-	useThread = enable;
+void ofxImageSequence::enableThreadedImport(bool enable){
+	ofLogVerbose("ofxImageSequence::enableThreadedImport") << enable;
+	useThreadToImport = enable;
 }
 
-void ofxImageSequence::cancelLoad()
+void ofxImageSequence::enableThreadedExport(bool enable) {
+	ofLogVerbose("ofxImageSequence::enableThreadedExport") << enable;
+	useThreadToExport = enable;
+}
+
+void ofxImageSequence::pauseImport()
 {
-	if(useThread && threadLoader != NULL){
-        threadLoader->cancel();
-        
-		delete threadLoader;
-		threadLoader = NULL;
+	if (importThread != NULL) {
+		importThread->pause();
+		ofLogNotice("ofxImageSequence::pauseImport") << "paused";
 	}
+	else {
+		ofLogVerbose("ofxImageSequence::pauseImport") << "nothing to do";
+	}
+}
+
+void ofxImageSequence::resumeImport()
+{
+	if (importThread != NULL) {
+		importThread->resume();
+		ofLogNotice("ofxImageSequence::resumeImport") << "resumed";
+	}
+	else {
+		ofLogVerbose("ofxImageSequence::resumeImport") << "nothing to do";
+	}
+}
+
+void ofxImageSequence::cancelImport()
+{
+	ofLogNotice("ofxImageSequence::cancelImport");
+	if(importThread != NULL){
+		importThread->cancel();
+//		completeImporting();	// done at updateThreadedLoad
+//		deleteImportThread();	// done at updateThreadedLoad
+		ofLogNotice("ofxImageSequence::cancelImport") << "canceled";
+	}
+	else {
+		ofLogVerbose("ofxImageSequence::cancelImport") << "nothing to do";
+	}
+}
+
+void ofxImageSequence::deleteImportThread()
+{
+	delete importThread;
+	importThread = NULL;
+}
+
+void ofxImageSequence::pauseExport()
+{
+	if (exportThread != NULL) {
+		exportThread->pause();
+		ofLogNotice("ofxImageSequence::pauseExport") << "paused";
+	}
+	else {
+		ofLogVerbose("ofxImageSequence::pauseExport") << "nothing to do";
+	}
+}
+
+void ofxImageSequence::resumeExport()
+{
+	if (exportThread != NULL) {
+		exportThread->resume();
+		ofLogNotice("ofxImageSequence::resumeExport") << "resumed";
+	}
+	else {
+		ofLogVerbose("ofxImageSequence::resumeExport") << "nothing to do";
+	}
+}
+
+void ofxImageSequence::cancelExport()
+{
+	if (exportThread != NULL) {
+		exportThread->cancel();
+		ofLogNotice("ofxImageSequence::cancelExport")<< "canceled";
+	}
+	else {
+		ofLogVerbose("ofxImageSequence::cancelExport") << "nothing to do";
+	}
+}
+
+void ofxImageSequence::deleteExportThread()
+{
+	delete exportThread;
+	exportThread = NULL;
 }
 
 void ofxImageSequence::setMinMagFilter(int newMinFilter, int newMagFilter)
@@ -282,59 +621,174 @@ void ofxImageSequence::setMinMagFilter(int newMinFilter, int newMagFilter)
 
 void ofxImageSequence::preloadAllFrames()
 {
-	if(sequence.size() == 0){
-		ofLogError("ofxImageSequence::loadFrame") << "Calling preloadAllFrames on unitialized image sequence.";
-		return;
-	}
+	//if(sequence.size() == 0){
+	//	ofLogError("ofxImageSequence::preloadAllFrames") << "Calling preloadAllFrames on unitialized image sequence.";
+	//	return;
+	//}
 	
-	for(int i = 0; i < sequence.size(); i++){
+	int framesToImport = expectedLength - lastImportedFrame;
+	ofLogVerbose() << "lastImportedFrame " << lastImportedFrame;
+	ofLogVerbose() << "sequence.size " << expectedLength;
+	ofLogVerbose() << "framesToLoad " << framesToImport;
+
+	for(int i = 0; i < framesToImport; i++){
 		//threaded stuff
-		if(useThread){
-			if(threadLoader == NULL){
+		if (useThreadToImport) {
+			if (importThread == NULL) {
+				ofLogError("ofxImageSequence::preloadAllFrames") << "importThread is NULL!";
 				return;
 			}
-            threadLoader->lock();
-            bool shouldExit = threadLoader->cancelLoading;
-            threadLoader->unlock();
-            if(shouldExit){
-                return;
-            }
+			importThread->lock();
+			bool shouldExit = importThread->cancelImport;
+			importThread->unlock();
+			if (shouldExit) {
+				return;
+			}
+		}
 
-			ofSleepMillis(15);
+		string filepath = folderToImport + "/" + filenames[lastImportedFrame] + "." + extensionImport;
+
+		if (ofFile(filepath).exists() == false) {
+			ofLogError("ofxImageSequence::readFileNames") << "Could not find file " << filepath;
 		}
-		curLoadFrame = i;
-		if(!ofLoadImage(sequence[i], filenames[i])){
-			loadFailed[i] = true;
-			ofLogError("ofxImageSequence::loadFrame") << "Image failed to load: " << filenames[i];		
+
+		sequence.push_back(ofPixels());
+		loadFailed.push_back(false);
+
+		if (!ofLoadImage(sequence[lastImportedFrame], filepath)) {
+			loadFailed[lastImportedFrame] = true;
+			ofLogError("ofxImageSequence::preloadAllFrames") << "Image failed to load: " << filepath;
 		}
+
+		ofLogVerbose() << "imported " << filenames[lastImportedFrame];
+		lastImportedFrame++;
+		
+		ofSleepMillis(5);
 	}
 }
 
-float ofxImageSequence::percentLoaded(){
-	if(isLoaded()){
-		return 1.0;
+void ofxImageSequence::exportAllFrames()
+{
+	if (expectedLength == 0) {
+		ofLogError("ofxImageSequence::exportAllFrames") << "Calling exportAllFrames on uninitialized image sequence.";
+		return;
 	}
-	if(isLoading() && sequence.size() > 0){
-		return 1.0*curLoadFrame / sequence.size();
+
+	int framesToExport = expectedLength - lastExportedFrame;
+	ofLogVerbose() << "lastImportedFrame " << lastExportedFrame;
+	ofLogVerbose() << "sequence.size " << expectedLength;
+	ofLogVerbose() << "framesToLoad " << framesToExport;
+
+	for (int i = 0; i < framesToExport; i++) {
+		//threaded stuff
+		if (useThreadToExport) {
+			if (exportThread == NULL) {
+				ofLogError("ofxImageSequence::exportAllFrames") << "exportThread is NULL!";
+				return;
+			}
+			exportThread->lock();
+			bool shouldExit = exportThread->cancelExport;
+			exportThread->unlock();
+			if (shouldExit) {
+				return;
+			}
+
+			string filepath = folderToExport + "/" + creationTimeStamp + "/" + filenames[lastExportedFrame] + "." + extensionExport;
+
+			ofFile file(filepath);
+			if (file.exists()) {
+				ofLogError("ofxImageSequence::exportAllFrames") << "file exists";
+				if (overwrite) {
+					ofLogVerbose("ofxImageSequence::exportAllFrames") << "overwriting";
+					ofSaveImage(sequence[lastExportedFrame], filepath);
+				}
+				else {
+					ofLogVerbose() << filepath;
+				}
+			}
+			else {
+				// need to add error checking ofSaveImage does not have any
+				ofSaveImage(sequence[lastExportedFrame], filepath, exportQuality);
+			}
+		}
+
+		ofLogVerbose() << "exported " << filenames[lastExportedFrame];
+		lastExportedFrame++;
+
+		ofSleepMillis(5);
+	}
+}
+
+void ofxImageSequence::enableOverwriteOnExport(bool enable)
+{
+	overwrite = enable;
+}
+
+float ofxImageSequence::percentExported() {
+	if (expectedLength > 0) {
+		return 1.0 * lastExportedFrame / expectedLength;
 	}
 	return 0.0;
 }
 
-void ofxImageSequence::loadFrame(int imageIndex)
+float ofxImageSequence::percentImported() {
+	if (expectedLength > 0) {
+		return 1.0 * lastImportedFrame / expectedLength;
+	}
+	return 0.0;
+}
+
+float ofxImageSequence::percentLoaded()
 {
-	if(lastFrameLoaded == imageIndex){
+	if (expectedLength > 0) {
+		return 1.0 * lastLoadedFrame / expectedLength;
+	}
+	return 0.0;
+}
+
+float ofxImageSequence::getCompletionPercent()
+{
+	switch (status)
+	{
+	case Status_Undefined:	return 0.0;
+	case Status_Loading:	return percentLoaded();
+	case Status_Importing:	return percentImported();
+	case Status_Exporting:	return percentExported();
+	case Status_Ready:		return 1.0;
+	default:				return 0.0f;
+	}
+}
+
+
+void ofxImageSequence::setCurrentFrameIndex(int index)
+{
+	if (isReady() == false || getTotalFrames() <= 0) {
+		ofLogError("ofxImageSequence::setCurrentFrameIndex") << "Sequence is not ready.";
+		return;
+	}
+
+	index = MAX(0, index);
+	index %= getTotalFrames();
+
+	loadFrameToTexture(index);
+	currentFrame = index;
+}
+
+void ofxImageSequence::loadFrameToTexture(int imageIndex)
+{
+	if(lastDisplayedFrame == imageIndex){
 		return;
 	}
 
 	if(imageIndex < 0 || imageIndex >= sequence.size()){
-		ofLogError("ofxImageSequence::loadFrame") << "Calling a frame out of bounds: " << imageIndex;
+		ofLogError("ofxImageSequence::loadFrameToTexture") << "Calling a frame out of bounds: " << imageIndex;
 		return;
 	}
 
 	if(!sequence[imageIndex].isAllocated() && !loadFailed[imageIndex]){
 		if(!ofLoadImage(sequence[imageIndex], filenames[imageIndex])){
 			loadFailed[imageIndex] = true;
-			ofLogError("ofxImageSequence::loadFrame") << "Image failed to load: " << filenames[imageIndex];
+			ofLogError("ofxImageSequence::loadFrameToTexture") << "Image failed to load: " << filenames[imageIndex];
 		}
 	}
 
@@ -344,8 +798,7 @@ void ofxImageSequence::loadFrame(int imageIndex)
 
 	texture.loadData(sequence[imageIndex]);
 
-	lastFrameLoaded = imageIndex;
-
+	lastDisplayedFrame = imageIndex;
 }
 
 float ofxImageSequence::getPercentAtFrameIndex(int index)
@@ -363,24 +816,15 @@ float ofxImageSequence::getHeight()
 	return height;
 }
 
-void ofxImageSequence::unloadSequence()
+void ofxImageSequence::deleteSequence()
 {
-	if(threadLoader != NULL){
-		delete threadLoader;
-		threadLoader = NULL;
-	}
+	cancelImport();
+	cancelExport();
 
 	sequence.clear();
 	filenames.clear();
 	loadFailed.clear();
-
-	loaded = false;
-	width = 0;
-	height = 0;
-	curLoadFrame = 0;
-	lastFrameLoaded = -1;
-	currentFrame = 0;	
-
+	texture.clear();
 }
 
 void ofxImageSequence::setFrameRate(float rate)
@@ -426,13 +870,13 @@ ofTexture* ofxImageSequence::getFrameForTime(float time)
 //deprecated
 ofTexture* ofxImageSequence::getFrame(int index)
 {
-	setFrame(index);
+	setCurrentFrameIndex(index);
 	return &getTexture();
 }
 
 ofTexture& ofxImageSequence::getTextureForFrame(int index)
 {
-	setFrame(index);
+	setCurrentFrameIndex(index);
 	return getTexture();
 }
 
@@ -447,24 +891,6 @@ ofTexture& ofxImageSequence::getTextureForPercent(float percent){
 	return getTexture();
 }
 
-void ofxImageSequence::setFrame(int index)
-{
-	if(!loaded){
-		ofLogError("ofxImageSequence::setFrame") << "Calling getFrame on unitialized image sequence.";
-		return;
-	}
-
-	if(index < 0){
-		ofLogError("ofxImageSequence::setFrame") << "Asking for negative index.";
-		return;
-	}
-	
-	index %= getTotalFrames();
-	
-	loadFrame(index);
-	currentFrame = index;
-}
-
 void ofxImageSequence::setFrameForTime(float time)
 {
 	float totalTime = sequence.size() / frameRate;
@@ -474,7 +900,17 @@ void ofxImageSequence::setFrameForTime(float time)
 
 void ofxImageSequence::setFrameAtPercent(float percent)
 {
-	setFrame(getFrameIndexAtPercent(percent));	
+	setCurrentFrameIndex(getFrameIndexAtPercent(percent));	
+}
+
+void ofxImageSequence::setExportQuality(ofImageQualityType q)
+{
+	exportQuality = q;
+}
+
+void ofxImageSequence::setCreationTimeStamp(string ts)
+{
+	creationTimeStamp = ts;
 }
 
 ofTexture& ofxImageSequence::getTexture()
@@ -487,6 +923,11 @@ const ofTexture& ofxImageSequence::getTexture() const
 	return texture;
 }
 
+ofPixels& ofxImageSequence::getPixels()
+{
+	return sequence[currentFrame];
+}
+
 float ofxImageSequence::getLengthInSeconds()
 {
 	return getTotalFrames() / frameRate;
@@ -496,11 +937,31 @@ int ofxImageSequence::getTotalFrames()
 {
 	return sequence.size();
 }
-
-bool ofxImageSequence::isLoaded(){						//returns true if the sequence has been loaded
-    return loaded;
+//returns true if the sequence has been fully imported
+bool ofxImageSequence::isImported(){						
+    return imported;
 }
-
-bool ofxImageSequence::isLoading(){
-	return threadLoader != NULL && threadLoader->loading;
+// bool ofxImageSequence::isImporting(){
+// 	return importThread != nullptr && (importThread->importing || importThread->paused);
+// }
+//returns true if the sequence has completed export
+bool ofxImageSequence::isExported() {						
+	return exported;
+}
+// bool ofxImageSequence::isExporting() {
+// 	return exportThread != nullptr && (exportThread->exporting || exportThread->paused);
+// }
+bool ofxImageSequence::isLoaded() {
+	return loaded;
+}
+bool ofxImageSequence::isLoading() {
+	return status == Status_Loading;
+}
+bool ofxImageSequence::isReady()
+{
+	return status == Status_Ready;
+}
+SequenceStatus ofxImageSequence::getStatus()
+{
+	return status;
 }
